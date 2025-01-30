@@ -1,0 +1,360 @@
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
+)
+
+var jwtSecretKey = []byte("your-secret-key")
+var connectedUsers = make(map[string]*Client)
+
+var conn *pgx.Conn
+
+type Subject interface {
+	RegisterClient(o Observer)
+	RemoveClient(o Observer)
+	NotifyObservers()
+}
+type Observer interface {
+	Update(newMessage interface{})
+}
+
+
+type chat struct {
+	mu         sync.Mutex
+	clients    []Observer
+	newMessage clientMessage
+}
+
+
+func (ch *chat) RegisterObserver(o Observer) {
+	fmt.Println("new client!")
+
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	ch.clients = append(ch.clients, o)
+}
+
+
+func (ch *chat) RemoveObserver(o Observer) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	for i, client := range ch.clients {
+		if client == o {
+			ch.clients = append(ch.clients[:i], ch.clients[i+1:]...)
+			break
+		}
+	}
+}
+
+// уведомляем клиентов о новом сообщении
+func (ch *chat) NotifyObservers() {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	for _, client := range ch.clients {
+		client.Update(ch.newMessage)
+	}
+}
+
+// стуктура клиента по соединению 
+type Client struct {
+	conn *websocket.Conn
+}
+type clientMessage struct {
+	Name        string `json:"name"`
+	Password    string `json:"password"`
+	Is_register bool   `json:"is_register"`
+	Message     string `json:"message"`
+	Token       string `json:"token"` // Добавлено поле для хранения токена
+}
+
+// структура для сообщений от сервера
+type serverMessage struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+}
+
+// Метод для отправки сообщений от сервера
+func (ch *chat) NotifyServerMessage(msg serverMessage) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	for _, client := range ch.clients {
+		client.Update(msg)
+	}
+}
+
+// Удаление клиента из списка подключенных
+func (c *chat) RemoveClientFromMap(clientName string) {
+	delete(connectedUsers, clientName)
+}
+func (c *chat) AutorizationCheck(newMessage clientMessage, newClient *Client) bool {
+	
+	if _, exists := connectedUsers[newMessage.Name]; exists {
+		log.Println("Пользователь уже подключен:", newMessage.Name)
+		return false 
+	}
+
+	var name string
+	var passwordHash string // Добавим переменную для пароля, если нужно
+
+	// Запрос к базе данных
+	row := conn.QueryRow(context.Background(), "SELECT name, password FROM users WHERE name=$1", newMessage.Name)
+
+	// Сканиуем результат
+	err := row.Scan(&name, &passwordHash)
+	fmt.Println("Имя и паролька", name, passwordHash)
+	if err != nil {
+		// Если нет пользователя с таким ID или произошла другая ошибка
+		if err == pgx.ErrNoRows {
+			log.Println("Пользователь не найден")
+		} else {
+			log.Println("Ошибка при запросе данных: ", err)
+		}
+		return false
+	}
+	passwordHash = strings.TrimSpace(passwordHash)
+	newMessage.Password = strings.TrimSpace(newMessage.Password)
+
+	// Если нашли пользователя, сравниваем пароль
+	log.Println("Пароли!", passwordHash, " Пароль полученный", newMessage.Password)
+	if passwordHash == newMessage.Password {
+		log.Println("Авторизация успешна")
+
+		// Генерация JWT токена после успешной авторизации
+		token, err := GenerateJWT(newMessage.Name, newMessage.Password, []byte("your-secret-key"))
+		if err != nil {
+			log.Printf("Ошибка при генерации токена: %v", err)
+			return false
+		}
+
+		// Отправляем токен пользователю
+		newMessage.Token = token
+		log.Printf("Пользователь %s успешно авторизован! Токен: %s", newMessage.Name, token)
+
+		chatRoom.NotifyServerMessage(serverMessage{Message: "Авторизация успешна", Type: "server"})
+		// Добавляем пользователя в список подключенных
+		connectedUsers[newMessage.Name] = newClient
+		return true
+	} else {
+		log.Println("Неверный пароль")
+		return false
+	}
+}
+
+func (c *chat) Registration(newMessage clientMessage) error {
+	var existingName string
+
+	log.Printf("Запрос на проверку существования пользователя с именем: %s", newMessage.Name)
+
+	// Выполняем запрос на поиск пользователя по имени
+	row := conn.QueryRow(context.Background(), "SELECT name FROM users WHERE name=$1", newMessage.Name)
+
+	err := row.Scan(&existingName)
+
+	if err != nil {
+		// Проверяем ошибку, если это не ErrNoRows, выводим подробное сообщение об ошибке
+		if err == pgx.ErrNoRows {
+			log.Printf("Пользователь с таким именем не найден, продолжаем регистрацию")
+
+			// Добавление нового пользователя
+			_, err := conn.Exec(context.Background(), "INSERT INTO users (name, password) VALUES ($1, $2)", newMessage.Name, newMessage.Password)
+			if err != nil {
+				log.Printf("Ошибка при добавлении нового пользователя: %v", err)
+				return fmt.Errorf("ошибка при добавлении нового пользователя: %v", err)
+			}
+
+			// Генерация JWT токена после регистрации
+			token, err := GenerateJWT(newMessage.Name, newMessage.Password, []byte("your-secret-key"))
+			if err != nil {
+				log.Printf("Ошибка при генерации токена: %v", err)
+				return fmt.Errorf("ошибка при генерации токена: %v", err)
+			}
+
+			// Отправляем токен пользователю
+			newMessage.Token = token
+			log.Printf("Пользователь %s успешно зарегистрирован! Токен: %s", newMessage.Name, token)
+			chatRoom.NotifyServerMessage(serverMessage{Message: "Регистрация успешна!", Type: "server"})
+
+			return nil
+		}
+
+		return fmt.Errorf("ошибка при проверке пользователя: %v", err)
+	}
+
+	log.Printf("Пользователь с таким именем %s уже существует", newMessage.Name)
+	return fmt.Errorf("Пользователь с таким именем уже существует")
+}
+
+// Метод для обновления состояния клиента
+func (c *Client) Update(newMessage interface{}) {
+	
+	switch msg := newMessage.(type) {
+	case clientMessage:
+		err := c.conn.WriteJSON(msg)
+		if err != nil {
+			log.Printf("Error sending client message: %v", err)
+			c.conn.Close()
+		}
+	case serverMessage:
+		err := c.conn.WriteJSON(msg)
+		if err != nil {
+			log.Printf("Error sending server message: %v", err)
+			c.conn.Close()
+		}
+	default:
+		log.Println("Unknown message type")
+	}
+}
+
+func (c *Client) Close() {
+	c.conn.Close()
+}
+
+// стуктура сообщений от клиентов кароче что то нужное наверное
+
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+var chatRoom = &chat{}
+
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Error upgrading to WebSocket: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Создаем нового клиента
+	newClient := &Client{conn}
+
+	// Читаем первое сообщение для авторизации
+	var msg clientMessage
+	err = conn.ReadJSON(&msg)
+	if err != nil {
+		log.Printf("Error reading initial authorization message: %v", err)
+		return
+	}
+	fmt.Println("Авторизация", msg.Password, msg.Name, msg.Is_register)
+
+	// Проверка на наличие уже подключенного пользователя
+	if _, exists := connectedUsers[msg.Name]; exists {
+		log.Printf("Пользователь %s уже подключен", msg.Name)
+		conn.WriteJSON(serverMessage{Message: "Пользователь уже подключен", Type: "server"})
+		return
+	}
+
+	// Регистрация или авторизация
+	if msg.Is_register {
+		err := chatRoom.Registration(msg)
+		if err != nil {
+			
+			log.Printf("Ошибка при регистрации: %v", err)
+			
+			conn.WriteJSON(serverMessage{Message: err.Error(), Type: "server"})
+		} else {
+			conn.WriteJSON(serverMessage{Message: "Регистрация успешна", Type: "server"})
+		}
+	} else {
+		// Если авторизация
+		chatRoom.NotifyServerMessage(serverMessage{Message: "Авторизация", Type: "server"})
+		if !chatRoom.AutorizationCheck(msg, newClient) {
+			
+			conn.WriteJSON(serverMessage{Message: "Неверный логин или пароль"})
+			fmt.Println("Неверный логин или пароль")
+		} else {
+			fmt.Println("новый клиент ", msg.Name)
+			conn.WriteJSON(serverMessage{Message: "Авторизация успешна", Type: "server"})
+		}
+	}
+
+	// Регистрируем клиента в чат
+	chatRoom.NotifyServerMessage(serverMessage{Message: "Подключился новый клиент:"})
+	chatRoom.RegisterObserver(newClient)
+
+	defer func() {
+		chatRoom.RemoveObserver(newClient)
+		chatRoom.RemoveClientFromMap(msg.Name) // Удаляем клиента из списка подключенных
+	}()
+
+	// Чтение сообщений от клиента
+	for {
+		var msg clientMessage
+		err := conn.ReadJSON(&msg)
+		if err != nil {
+			log.Printf("---Error reading JSON: %v", err)
+			break
+		}
+		log.Printf("Received: Name=%s, Message=%s", msg.Name, msg.Message)
+
+		chatRoom.newMessage = msg
+		chatRoom.NotifyObservers()
+	}
+}
+
+func main() {
+	//подключение к бд
+	var err error
+	conn, err = pgx.Connect(context.Background(), "postgres://postgres:1234@[::1]:5432/USERS?sslmode=disable")
+	if err != nil {
+		log.Fatalf("Не удалось подключиться к базе данных: %v", err)
+	}
+	defer conn.Close(context.Background())
+
+	// Контекст для graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fs := http.FileServer(http.Dir("./dist"))
+	http.Handle("/", fs)
+	http.HandleFunc("/ws", handleConnections)
+
+	server := &http.Server{Addr: ":8080"}
+
+	// Канал для завершения
+	shutdownComplete := make(chan struct{})
+
+	// Горутина для запуска сервера
+	go func() {
+		log.Println("Server started on :8080")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("Shutdown signal received")
+	chatRoom.NotifyServerMessage(serverMessage{Message: "Сервер прекратил соединение"})
+	
+	stop()
+	log.Println("Closing WebSocket connections...")
+	chatRoom.mu.Lock()
+	for _, client := range chatRoom.clients {
+		client.(*Client).Close()
+	}
+	chatRoom.mu.Unlock()
+
+	
+	ctxShutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctxShutdown); err != nil {
+		log.Fatalf("Server Shutdown Failed:%+v", err)
+	}
+
+	close(shutdownComplete)
+	log.Println("Server stopped gracefully")
+}

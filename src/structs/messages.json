@@ -1,0 +1,15 @@
+[
+    {
+      "name": "Tea",
+      "password": "thr",
+      "is_register": false,
+      "message": "Привет, сервер!"
+    },
+    {
+      "name": "Tea1",
+      "password": "thr",
+      "is_register": false,
+      "message": "Hello, server!"
+    }
+  ]
+  

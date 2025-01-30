@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat App</title>
+</head>
+<body>
+   <div class="entry">
+    <h2>Вход</h2>
+    <!-- Кнопки для переключения между формами -->
+    <div class="mb-3">
+        <button type="button" class="btn btn-outline-primary entry-form__registration-button">Регистрация</button>
+        <button type="button" class="btn btn-outline-secondary entry-form__authorization-button">Авторизация</button>
+    </div>
+    <!-- Сообщения об ошибках -->
+    <div id="error-message" class="text-danger hidden"></div>
+    <!-- Форма авторизации -->
+    <form name="authorization" class="hidden" autocomplete="off">
+        <div class="mb-3">
+            <label for="authUsername" class="form-label">Имя пользователя</label>
+            <input name="username" type="text" class="form-control" id="authUsername" placeholder="Имя пользователя" required autocomplete="off">
+        </div>
+        <div class="mb-3">
+            <label for="authPassword" class="form-label">Пароль</label>
+            <input name="password" type="password" class="form-control" id="authPassword" placeholder="Пароль" required autocomplete="off">
+        </div>
+        <button type="submit" class="btn btn-primary">Войти</button>
+    </form>
+    <!-- Форма регистрации -->
+    <form name="register" class="mb-3">
+        <div class="mb-3">
+            <label for="regUsername" class="form-label">Имя пользователя</label>
+            <input name="username" type="text" class="form-control" id="regUsername" placeholder="Имя пользователя" required>
+        </div>
+        <div class="mb-3">
+            <label for="regPassword" class="form-label">Пароль</label>
+            <input name="password" type="password" class="form-control" id="regPassword" placeholder="Пароль" required>
+        </div>
+        <button type="submit" class="btn btn-success">Зарегистрироваться</button>
+    </form>
+</div>
+    <!-- Чат -->
+    <div id="chat" class="hidden">
+        <h2>Чат</h2>
+        <div id="messages" style="height: 300px; overflow-y: scroll; border: 1px solid #131212; padding: 10px;"></div>
+        <input id="message" type="text" placeholder="Введите сообщение">
+        <button id="send">Отправить</button>
+    </div>
+</body>
+</html>
